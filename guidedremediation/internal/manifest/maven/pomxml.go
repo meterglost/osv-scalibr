@@ -280,12 +280,16 @@ func (r readWriter) Read(path string, fsys scalibrfs.FS) (manifest.Manifest, err
 		}
 	}
 
+	// Build workspace index for local BOM resolution.
+	wsIndex := mavenutil.BuildWorkspaceIndex(filesystem.ScanInput{FS: fsys}, []string{path})
+	scanInput := &filesystem.ScanInput{FS: fsys, Path: path}
+
 	// Process the dependencies:
 	//  - dedupe dependencies and dependency management
 	//  - import dependency management
 	//  - fill in missing dependency version requirement
 	project.ProcessDependencies(func(groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
-		return mavenutil.GetDependencyManagement(ctx, r.MavenRegistryAPIClient, groupID, artifactID, version)
+		return mavenutil.GetDependencyManagement(ctx, r.MavenRegistryAPIClient, groupID, artifactID, version, wsIndex, scanInput, nil)
 	})
 
 	groups := make(map[manifest.RequirementKey][]string)
