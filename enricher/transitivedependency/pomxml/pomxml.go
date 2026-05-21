@@ -22,10 +22,12 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 
 	"deps.dev/util/maven"
 	"deps.dev/util/resolve"
 	mavenresolve "deps.dev/util/resolve/maven"
+	"golang.org/x/sync/errgroup"
 	cpb "github.com/google/osv-scalibr/binary/proto/config_go_proto"
 	"github.com/google/osv-scalibr/clients/datasource"
 	"github.com/google/osv-scalibr/clients/resolution"
@@ -127,37 +129,67 @@ func (e Enricher) Enrich(ctx context.Context, input *enricher.ScanInput, inv *in
 		log.Warn("Warning: enricher transitivedependency/pomxml may be risky when run on untrusted artifacts. Please ensure you trust the source code and artifacts.")
 	}
 
-	var errs error
+	// Build workspace index by tracing module declarations from known pom.xml paths.
+	pomPaths := make([]string, 0, len(pkgGroups))
+	for p := range pkgGroups {
+		pomPaths = append(pomPaths, p)
+	}
+	wsIndex := mavenutil.BuildWorkspaceIndex(filesystem.ScanInput{
+		FS: input.ScanRoot.FS,
+	}, pomPaths)
+
+	// BOM cache shared across all modules to avoid redundant remote fetches.
+	bomCache := datasource.NewRequestCache[string, maven.DependencyManagement]()
+
+	// Process modules in parallel to speed up resolution.
+	var (
+		mu   sync.Mutex
+		errs error
+	)
+	g, ctx := errgroup.WithContext(ctx)
+	// Limit concurrency to avoid overwhelming the system or being rate-limited by remote registries.
+	g.SetLimit(10)
+
 	for path, pkgMap := range pkgGroups {
-		f, err := input.ScanRoot.FS.Open(path)
+		g.Go(func() error {
+			f, err := input.ScanRoot.FS.Open(path)
+			if err != nil {
+				log.Warnf("failed to open %s: %v", path, err)
+				mu.Lock()
+				errs = errors.Join(errs, fmt.Errorf("failed to open %s: %w", path, err))
+				mu.Unlock()
+				return nil
+			}
+			defer f.Close()
 
-		if err != nil {
-			log.Warnf("failed to open %s: %v", path, err)
-			errs = errors.Join(errs, fmt.Errorf("failed to open %s: %w", path, err))
-			continue
-		}
+			enrichedInv, err := e.extract(ctx, &filesystem.ScanInput{
+				Path:   path,
+				Reader: f,
+				Info:   nil,
+				FS:     input.ScanRoot.FS,
+				Root:   input.ScanRoot.Path,
+			}, wsIndex, bomCache)
 
-		enrichedInv, err := e.extract(ctx, &filesystem.ScanInput{
-			Path:   path,
-			Reader: f,
-			Info:   nil,
-			FS:     input.ScanRoot.FS,
-			Root:   input.ScanRoot.Path,
+			if err != nil {
+				log.Warnf("failed resolution for %s: %v", path, err)
+				mu.Lock()
+				errs = errors.Join(errs, fmt.Errorf("failed resolution for %s: %w", path, err))
+				mu.Unlock()
+				return nil
+			}
+
+			mu.Lock()
+			internal.Add(enrichedInv.Packages, inv, Name, pkgMap)
+			mu.Unlock()
+			return nil
 		})
-
-		if err != nil {
-			log.Warnf("failed resolution for %s: %v", path, err)
-			errs = errors.Join(errs, fmt.Errorf("failed resolution for %s: %w", path, err))
-			continue
-		}
-
-		internal.Add(enrichedInv.Packages, inv, Name, pkgMap)
 	}
 
+	_ = g.Wait()
 	return errs
 }
 
-func (e Enricher) extract(ctx context.Context, input *filesystem.ScanInput) (inventory.Inventory, error) {
+func (e Enricher) extract(ctx context.Context, input *filesystem.ScanInput, wsIndex mavenutil.WorkspaceIndex, bomCache *datasource.RequestCache[string, maven.DependencyManagement]) (inventory.Inventory, error) {
 	var project maven.Project
 	if err := datasource.NewMavenDecoder(input.Reader).Decode(&project); err != nil {
 		return inventory.Inventory{}, fmt.Errorf("could not extract: %w", err)
@@ -200,7 +232,7 @@ func (e Enricher) extract(ctx context.Context, input *filesystem.ScanInput) (inv
 	//  - import dependency management
 	//  - fill in missing dependency version requirement
 	project.ProcessDependencies(func(groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
-		return mavenutil.GetDependencyManagement(ctx, e.MavenClient, groupID, artifactID, version)
+		return mavenutil.GetDependencyManagement(ctx, e.MavenClient, groupID, artifactID, version, wsIndex, input, bomCache)
 	})
 
 	if registries := e.MavenClient.GetRegistries(); len(registries) > 0 {
@@ -215,8 +247,47 @@ func (e Enricher) extract(ctx context.Context, input *filesystem.ScanInput) (inv
 		}
 	}
 
+	// Share the BOM cache with the DepClient so resolver.Resolve() reuses
+	// BOMs already fetched during ProcessDependencies.
+	if mc, ok := e.DepClient.(*resolution.MavenRegistryClient); ok {
+		mc.SetBOMCache(bomCache)
+	}
+
 	overrideClient := resolution.NewOverrideClient(e.DepClient)
 	resolver := mavenresolve.NewResolver(overrideClient)
+
+	// Register workspace-local modules as stub versions in the override client.
+	// This prevents the resolver from trying to fetch them from remote repositories where they don't exist.
+	// Each module's actual transitive dependencies are resolved when that module is scanned independently.
+	wsVersion := string(project.Version)
+	if strings.Contains(wsVersion, "${") {
+		for _, prop := range project.Properties.Properties {
+			wsVersion = strings.ReplaceAll(wsVersion, "${"+prop.Name+"}", string(prop.Value))
+		}
+	}
+	if wsIndex != nil {
+		for name, mod := range wsIndex {
+			ver := mod.Version
+			if ver == "" || strings.Contains(ver, "${") {
+				// Fallback to project version if module version is unresolved.
+				// This is common when modules share a parent version.
+				ver = wsVersion
+			}
+			if ver == "" || strings.Contains(ver, "${") {
+				continue
+			}
+			overrideClient.AddVersion(resolve.Version{
+				VersionKey: resolve.VersionKey{
+					PackageKey: resolve.PackageKey{
+						System: resolve.Maven,
+						Name:   name,
+					},
+					VersionType: resolve.Concrete,
+					Version:     ver,
+				},
+			}, nil)
+		}
+	}
 
 	// Resolve the dependencies.
 	root := resolve.Version{

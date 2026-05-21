@@ -29,7 +29,8 @@ import (
 
 // MavenRegistryClient is a client to fetch data from Maven registry.
 type MavenRegistryClient struct {
-	api *datasource.MavenRegistryAPIClient
+	api      *datasource.MavenRegistryAPIClient
+	bomCache *datasource.RequestCache[string, maven.DependencyManagement]
 }
 
 // NewMavenRegistryClient makes a new MavenRegistryClient.
@@ -38,7 +39,7 @@ func NewMavenRegistryClient(ctx context.Context, remote, local string, disableGo
 	if err != nil {
 		return nil, err
 	}
-	return &MavenRegistryClient{api: client}, nil
+	return &MavenRegistryClient{api: client, bomCache: datasource.NewRequestCache[string, maven.DependencyManagement]()}, nil
 }
 
 // NewMavenRegistryClientWithAPI makes a new MavenRegistryClient with the given Maven registry client.
@@ -46,7 +47,16 @@ func NewMavenRegistryClientWithAPI(api *datasource.MavenRegistryAPIClient) *Mave
 	if api == nil {
 		panic("NewMavenRegistryClientWithAPI: api must not be nil")
 	}
-	return &MavenRegistryClient{api: api}
+	return &MavenRegistryClient{api: api, bomCache: datasource.NewRequestCache[string, maven.DependencyManagement]()}
+}
+
+// SetBOMCache sets the BOM cache used by this client.
+// This allows sharing a cache between the enricher's ProcessDependencies
+// and the resolver's Requirements() calls to avoid redundant remote fetches.
+func (c *MavenRegistryClient) SetBOMCache(cache *datasource.RequestCache[string, maven.DependencyManagement]) {
+	if cache != nil {
+		c.bomCache = cache
+	}
 }
 
 // Version returns metadata of a version specified by the VersionKey.
@@ -141,11 +151,16 @@ func (c *MavenRegistryClient) Requirements(ctx context.Context, vk resolve.Versi
 		return nil, err
 	}
 	proj.ProcessDependencies(func(groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
-		return mavenutil.GetDependencyManagement(ctx, c.api, groupID, artifactID, version)
+		return mavenutil.GetDependencyManagement(ctx, c.api, groupID, artifactID, version, nil, nil, c.bomCache)
 	})
 
 	reqs := make([]resolve.RequirementVersion, 0, len(proj.Dependencies))
 	for _, d := range proj.Dependencies {
+		// Skip dependencies with empty or unresolved versions.
+		// These occur when the managing BOM chain is incomplete.
+		if d.Version == "" || strings.Contains(string(d.Version), "${") {
+			continue
+		}
 		reqs = append(reqs, resolve.RequirementVersion{
 			VersionKey: resolve.VersionKey{
 				PackageKey: resolve.PackageKey{

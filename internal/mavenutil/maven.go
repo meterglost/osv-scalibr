@@ -27,6 +27,7 @@ import (
 	"deps.dev/util/semver"
 	"github.com/google/osv-scalibr/clients/datasource"
 	"github.com/google/osv-scalibr/extractor/filesystem"
+	"github.com/google/osv-scalibr/log"
 )
 
 // Origin of the dependencies.
@@ -212,8 +213,154 @@ func ParentPOMPath(input *filesystem.ScanInput, currentPath, relativePath string
 	return ""
 }
 
-// GetDependencyManagement returns managed dependencies in the specified Maven project by fetching remote pom.xml.
-func GetDependencyManagement(ctx context.Context, client *datasource.MavenRegistryAPIClient, groupID, artifactID, version maven.String) (maven.DependencyManagement, error) {
+// WorkspaceModule stores the path and version of a Maven module in the workspace.
+type WorkspaceModule struct {
+	Path    string
+	Version string
+}
+
+// WorkspaceIndex maps Maven coordinates (groupId:artifactId) to their
+// local path and version. This enables O(1) lookups when resolving
+// workspace-local BOMs during dependency processing.
+type WorkspaceIndex map[string]WorkspaceModule
+
+// pomWithModules is used to parse a pom.xml including its <modules> section.
+type pomWithModules struct {
+	maven.Project
+	Modules []string `xml:"modules>module"`
+}
+
+// BuildWorkspaceIndex builds an index of Maven modules by tracing the reactor
+// structure from the given pom.xml paths. Instead of walking the entire filesystem,
+// it follows <modules> declarations and parent references to discover all related
+// modules. This should be called once per scan and reused for all
+// GetDependencyManagement calls.
+func BuildWorkspaceIndex(fsys filesystem.ScanInput, pomPaths []string) WorkspaceIndex {
+	if fsys.FS == nil || len(pomPaths) == 0 {
+		return nil
+	}
+
+	idx := make(WorkspaceIndex)
+	visited := make(map[string]bool)
+
+	// indexPom reads a pom.xml and adds it to the index, then recursively
+	// indexes any <modules> declared in it.
+	var indexPom func(pomPath string)
+	indexPom = func(pomPath string) {
+		if visited[pomPath] {
+			return
+		}
+		visited[pomPath] = true
+
+		f, err := fsys.FS.Open(pomPath)
+		if err != nil {
+			return
+		}
+		var proj pomWithModules
+		decodeErr := datasource.NewMavenDecoder(f).Decode(&proj)
+		f.Close()
+		if decodeErr != nil {
+			return
+		}
+
+		key := ProjectKey(proj.Project)
+		if key.GroupID != "" && key.ArtifactID != "" {
+			idx[key.Name()] = WorkspaceModule{
+				Path:    pomPath,
+				Version: string(key.Version),
+			}
+		}
+
+		// Trace child modules.
+		parentDir := filepath.Dir(pomPath)
+		for _, mod := range proj.Modules {
+			childPom := filepath.Join(parentDir, mod, "pom.xml")
+			childPom = filepath.ToSlash(childPom)
+			indexPom(childPom)
+		}
+
+		// Trace parent (walk up to root reactor).
+		if proj.Parent.ArtifactID != "" {
+			relPath := string(proj.Parent.RelativePath)
+			if relPath == "" {
+				relPath = "../pom.xml"
+			}
+			parentPom := filepath.Join(parentDir, relPath)
+			parentPom = filepath.ToSlash(filepath.Clean(parentPom))
+			indexPom(parentPom)
+		}
+	}
+
+	for _, p := range pomPaths {
+		indexPom(p)
+	}
+
+	log.Infof("built workspace index with %d Maven modules from %d starting POMs", len(idx), len(pomPaths))
+	return idx
+}
+
+// LoadLocalProject loads and parses a pom.xml from the workspace filesystem.
+// Note: Interpolate() is NOT called here — callers should merge parents first,
+// then interpolate, to avoid dropping dependencies with parent-defined properties.
+func LoadLocalProject(input *filesystem.ScanInput, path string) (maven.Project, error) {
+	f, err := input.FS.Open(path)
+	if err != nil {
+		return maven.Project{}, fmt.Errorf("failed to open local project %s: %w", path, err)
+	}
+	var proj maven.Project
+	decodeErr := datasource.NewMavenDecoder(f).Decode(&proj)
+	f.Close()
+	if decodeErr != nil {
+		return maven.Project{}, fmt.Errorf("failed to decode local project %s: %w", path, decodeErr)
+	}
+	return proj, nil
+}
+
+// GetDependencyManagement returns managed dependencies in the specified Maven project.
+// If wsIndex and input are provided, it first attempts to resolve the project from
+// the local workspace before falling back to fetching from remote Maven registries.
+// Results are cached via bomCache to avoid redundant remote fetches. Concurrent
+// requests for the same BOM are coalesced automatically.
+func GetDependencyManagement(ctx context.Context, client *datasource.MavenRegistryAPIClient, groupID, artifactID, version maven.String, wsIndex WorkspaceIndex, input *filesystem.ScanInput, bomCache *datasource.RequestCache[string, maven.DependencyManagement]) (maven.DependencyManagement, error) {
+	cacheKey := fmt.Sprintf("%s:%s:%s", groupID, artifactID, version)
+
+	if bomCache == nil {
+		return getDependencyManagementUncached(ctx, client, groupID, artifactID, version, wsIndex, input)
+	}
+
+	return bomCache.Get(cacheKey, func() (maven.DependencyManagement, error) {
+		return getDependencyManagementUncached(ctx, client, groupID, artifactID, version, wsIndex, input)
+	})
+}
+
+// getDependencyManagementUncached performs the actual resolution without caching.
+func getDependencyManagementUncached(ctx context.Context, client *datasource.MavenRegistryAPIClient, groupID, artifactID, version maven.String, wsIndex WorkspaceIndex, input *filesystem.ScanInput) (maven.DependencyManagement, error) {
+	// Try local workspace resolution first.
+	if wsIndex != nil && input != nil {
+		name := maven.ProjectKey{GroupID: groupID, ArtifactID: artifactID}.Name()
+		if mod, ok := wsIndex[name]; ok {
+			result, err := LoadLocalProject(input, mod.Path)
+			if err != nil {
+				log.Warnf("failed to load local project %s: %v, falling back to remote", mod.Path, err)
+			} else {
+				log.Debugf("resolved %s:%s locally from %s", groupID, artifactID, mod.Path)
+				// Merge parents to get inherited dependency management.
+				if err := MergeParents(ctx, result.Parent, &result, Options{
+					Input:              input,
+					Client:             client,
+					AddRegistry:        false,
+					AllowLocal:         true,
+					InitialParentIndex: 1,
+				}); err != nil {
+					log.Warnf("failed to merge parents for local %s: %v, falling back to remote", mod.Path, err)
+				} else {
+					return result.DependencyManagement, nil
+				}
+			}
+		}
+	}
+
+	// Fall back to fetching from remote.
 	root := maven.Parent{ProjectKey: maven.ProjectKey{GroupID: groupID, ArtifactID: artifactID, Version: version}}
 	var result maven.Project
 	// To get dependency management from another project, we need the
